@@ -16,6 +16,7 @@ from PIL import Image
 from cotracker.utils.visualizer import Visualizer, read_video_from_path
 from cotracker.predictor import CoTrackerPredictor
 from tqdm import tqdm
+
 DEFAULT_DEVICE = (
     "cuda"
     if torch.cuda.is_available()
@@ -24,33 +25,6 @@ DEFAULT_DEVICE = (
 
 # if DEFAULT_DEVICE == "mps":
 #     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
-
-def read_frames_from_dir(frame_dir):
-    """从目录中读取帧序列，支持 frame_{frameid}.jpg 格式"""
-    frame_files = glob.glob(os.path.join(frame_dir, "frame_*.jpg"))
-    frame_files += glob.glob(os.path.join(frame_dir, "frame_*.png"))
-
-    if not frame_files:
-        raise ValueError(f"在 {frame_dir} 中没有找到 frame_*.jpg 或 frame_*.png 文件")
-
-    # 提取帧ID并排序
-    def extract_frame_id(filepath):
-        basename = os.path.basename(filepath)
-        match = re.search(r"frame_(\d+)", basename)
-        if match:
-            return int(match.group(1))
-        return 0
-
-    frame_files.sort(key=extract_frame_id)
-
-    frames = []
-    for frame_file in frame_files:
-        frame = np.array(Image.open(frame_file))
-        frames.append(frame)
-
-    print(f"从 {frame_dir} 读取了 {len(frames)} 帧")
-    return np.stack(frames)
 
 
 def read_frames_list_from_dir(frame_dir):
@@ -78,11 +52,42 @@ def LoadFrameFromFileList(frame_files):
     def load_frame(frame_file):
         return np.array(Image.open(frame_file))
 
+    # Using ThreadPoolExecutor inside here as well for parallel file reading
     with ThreadPoolExecutor() as executor:
         frames = list(executor.map(load_frame, frame_files))
 
-    print(f"从文件列表中读取了 {len(frames)} 帧")
+    # print(f"从文件列表中读取了 {len(frames)} 帧")
     return np.stack(frames)
+
+
+def save_and_visualize(save_dir, video_path, startindex, endindex, tracks, visibility, video_tensor, query_frame):
+    """
+    Background task to save results and visualize.
+    Everything here should be on CPU.
+    """
+    save_path = os.path.join(save_dir, f"{startindex}_{endindex}")
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Save npz
+    np.savez_compressed(
+        os.path.join(save_path, "track.npz"), 
+        tracks=tracks, 
+        visibility=visibility
+    )
+    
+    # Visualize
+    vis = Visualizer(save_dir=f"./saved_videos/{startindex}_{endindex}", pad_value=120, linewidth=3)
+    vis.visualize(
+        video_tensor, # Ensure this is on CPU
+        torch.from_numpy(tracks),      # Visualizer expects tensor or numpy? Check existing usage. 
+                                     # Existing usage: pred_tracks (tensor on GPU)
+                                     # But here we passed numpy. Let's check Visualizer code or just pass tensors back.
+                                     # To be safe and avoid passing GPU tensors to thread, we pass CPU tensors.
+                                     # Visualizer usually handles CPU tensors fine.
+        torch.from_numpy(visibility),
+        query_frame=query_frame,
+    )
+    # print(f"Finished saving and visualizing for chunk {startindex}_{endindex}")
 
 
 if __name__ == "__main__":
@@ -104,7 +109,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--checkpoint",
-        # default="./checkpoints/cotracker.pth",
         default=None,
         help="CoTracker model parameters",
     )
@@ -157,30 +161,45 @@ if __name__ == "__main__":
     else:
         model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
     model = model.to(DEFAULT_DEVICE)
-    # load the input video frame by frame
+    
     if args.frame_dir is None:
         exit("请提供 --frame_dir 参数，指向包含 frame_*.jpg/png 文件的目录")
 
     frame_files = read_frames_list_from_dir(args.frame_dir)
     videochunks = (len(frame_files) + args.chunksize - 1) // args.chunksize
+    
+    # Create a thread pool for background saving/visualization
+    # Adjust max_workers as needed. Too high might cause OOM or IO contention.
+    save_executor = ThreadPoolExecutor(max_workers=16) 
+    futures = []
+
     for chunkidx in tqdm(range(videochunks), desc="Processing chunks"):
         startindex = chunkidx * args.chunksize
         endindex = min((chunkidx + 1) * args.chunksize, len(frame_files))
         chunk_frame_files = frame_files[startindex:endindex]
-        video = LoadFrameFromFileList(chunk_frame_files)
-        video = torch.from_numpy(video).permute(0, 3, 1, 2)[None].float()
+        save_path = os.path.join(args.save_dir, f"{startindex}_{endindex}")
+        if os.path.exists(save_path):
+            print(f"Skipping already processed chunk {startindex}_{endindex}")
+            continue
+        # Parallel Image Loading (IO Bound)
+        video_np = LoadFrameFromFileList(chunk_frame_files)
+        video = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None].float()
         video = video.to(DEFAULT_DEVICE)
+        
         firstFrameName = os.path.basename(chunk_frame_files[0])
         base_name,_ = os.path.splitext(firstFrameName)
         sargs = base_name.split("_")
         num = int(sargs[-1])
         grid_query_frame = args.grid_query_frame if startindex + args.grid_query_frame < endindex else 0
-        # 1->000001
+        
+        # Mask Loading
         base_name = f'{sargs[0]}_{(num + grid_query_frame):06d}'
         firstMaskPath = os.path.join(args.mask_path, base_name + '.png')
-        print("Using mask:", firstMaskPath)
+        # print("Using mask:", firstMaskPath)
         segm_mask = np.array(Image.open(firstMaskPath))
         segm_mask = torch.from_numpy(segm_mask)[None, None]
+        
+        # Inference (GPU Bound)
         pred_tracks, pred_visibility = model(
             video,
             grid_size=args.grid_size,
@@ -188,24 +207,32 @@ if __name__ == "__main__":
             backward_tracking=args.backward_tracking,
             segm_mask=segm_mask,
         )
-        # 这里顺便输出一下用时
-        save_path = os.path.join(args.save_dir, f"{startindex}_{endindex}")
-        os.makedirs(save_path, exist_ok=True)
-        np.savez_compressed(os.path.join(save_path, "track.npz"), tracks=pred_tracks.cpu().numpy(), visibility=pred_visibility.cpu().numpy())
-        vis = Visualizer(save_dir=f"./saved_videos/{startindex}_{endindex}", pad_value=120, linewidth=3)
-        vis.visualize(
-            video,
-            pred_tracks,
-            pred_visibility,
-            query_frame=0 if args.backward_tracking else args.grid_query_frame,
+        
+        # Move results to CPU for async processing
+        tracks_cpu = pred_tracks.cpu().numpy()
+        visibility_cpu = pred_visibility.cpu().numpy()
+        video_cpu = video.cpu() # Tensor
+        
+        query_frame_val = 0 if args.backward_tracking else grid_query_frame
+        
+        # Submit task to background thread
+        future = save_executor.submit(
+            save_and_visualize,
+            args.save_dir,
+            f"./saved_videos/{startindex}_{endindex}", # Note: logic inside uses this as base
+            startindex,
+            endindex,
+            tracks_cpu,
+            visibility_cpu,
+            video_cpu,
+            query_frame_val
         )
-    print("computed")
-    
-    # # save a video with predicted tracks
-    # vis = Visualizer(save_dir="./saved_videos", pad_value=120, linewidth=3)
-    # vis.visualize(
-    #     video,
-    #     pred_tracks,
-    #     pred_visibility,
-    #     query_frame=0 if args.backward_tracking else args.grid_query_frame,
-    # )
+        futures.append(future)
+        torch.cuda.empty_cache()  # Clear GPU memory after each chunk to avoid OOM
+    print("Inference loop finished. Waiting for background tasks...")
+    # Wait for all background tasks to complete
+    for f in futures:
+        f.result() # This will also raise any exceptions that occurred in threads
+        
+    save_executor.shutdown()
+    print("All computed and saved.")

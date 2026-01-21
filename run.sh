@@ -1,0 +1,1 @@
+python infer_parallel.py --frame_dir ../D4/mymovies/Remake2/images/ --mask_path ../HybridNets/Remake2Result/ --checkpoint checkpoints/scaled_offline.pth --offline --grid_size 60 -c 40
