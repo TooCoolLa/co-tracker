@@ -210,9 +210,49 @@ if __name__ == "__main__":
         
         # Move results to CPU for async processing
         tracks_cpu = pred_tracks.cpu().numpy()
+        # n,pointcount
         visibility_cpu = pred_visibility.cpu().numpy()
         video_cpu = video.cpu() # Tensor
-        
+        visdata = visibility_cpu[0]
+        trackdata = tracks_cpu[0]
+        for i in range(visdata.shape[0]):
+            # 获取当前帧的文件名（不含扩展名），使用 basename 避免路径拼接错误
+            frame_path = chunk_frame_files[i]
+            base_name = os.path.splitext(os.path.basename(frame_path))[0]
+            mask_path = os.path.join(args.mask_path, base_name + '.png')
+            
+            if not os.path.exists(mask_path):
+                continue
+            
+            mask = np.array(Image.open(mask_path))
+            
+            # 获取当前帧所有点的坐标 (N, 2)
+            coords = trackdata[i]
+            
+            # 四舍五入取整并转换为整数索引
+            x = np.rint(coords[:, 0]).astype(np.int32)
+            y = np.rint(coords[:, 1]).astype(np.int32)
+            
+            h, w = mask.shape[:2]
+            
+            # 筛选出在图像范围内的有效点索引
+            valid_idx = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+            
+            # 检查Mask值，黑色(0)为不可见
+            # 支持灰度图(ndim=2)和RGB图(ndim=3)
+            if mask.ndim == 2:
+                is_black = (mask[y[valid_idx], x[valid_idx]] == 0)
+            else:
+                is_black = np.all(mask[y[valid_idx], x[valid_idx]] == 0, axis=-1)
+            
+            # 更新visibility
+            # 创建一个需要置为False的点的布尔掩码 (N,)
+            to_hide = np.zeros(visdata.shape[1], dtype=bool)
+            to_hide[valid_idx] = is_black
+            
+            # 将对应点的visibility设置为False
+            visdata[i, to_hide] = False
+
         query_frame_val = 0 if args.backward_tracking else grid_query_frame
         
         # Submit task to background thread
