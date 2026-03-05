@@ -60,34 +60,51 @@ def LoadFrameFromFileList(frame_files):
     return np.stack(frames)
 
 
-def save_and_visualize(save_dir, video_path, startindex, endindex, tracks, visibility, video_tensor, query_frame):
+def save_and_visualize(save_dir, video_path, startindex, endindex, tracks, visibility, video_tensor, query_frame, new_frames_start=0, save_overlap=False):
     """
     Background task to save results and visualize.
     Everything here should be on CPU.
+    
+    Args:
+        new_frames_start: Index of first new (non-overlapping) frame in the chunk
+        save_overlap: If True, save all frames including overlap; if False, only save new frames
     """
     save_path = os.path.join(save_dir, f"{startindex}_{endindex}")
     os.makedirs(save_path, exist_ok=True)
     
+    # Slice data to exclude overlap frames if requested
+    if not save_overlap and new_frames_start > 0:
+        tracks_to_save = tracks[:, new_frames_start:]
+        visibility_to_save = visibility[:, new_frames_start:]
+        video_to_save = video_tensor[:, new_frames_start:]
+        # Adjust query_frame if it's within the saved range
+        if query_frame >= new_frames_start:
+            adjusted_query_frame = query_frame - new_frames_start
+        else:
+            adjusted_query_frame = 0
+    else:
+        tracks_to_save = tracks
+        visibility_to_save = visibility
+        video_to_save = video_tensor
+        adjusted_query_frame = query_frame
+    
     # Save npz
     np.savez_compressed(
         os.path.join(save_path, "track.npz"), 
-        tracks=tracks, 
-        visibility=visibility
+        tracks=tracks_to_save, 
+        visibility=visibility_to_save,
+        new_frames_start=new_frames_start,
+        has_overlap=(new_frames_start > 0)
     )
     
     # Visualize
     vis = Visualizer(save_dir=f"./saved_videos/{startindex}_{endindex}", pad_value=120, linewidth=3)
     vis.visualize(
-        video_tensor, # Ensure this is on CPU
-        torch.from_numpy(tracks),      # Visualizer expects tensor or numpy? Check existing usage. 
-                                     # Existing usage: pred_tracks (tensor on GPU)
-                                     # But here we passed numpy. Let's check Visualizer code or just pass tensors back.
-                                     # To be safe and avoid passing GPU tensors to thread, we pass CPU tensors.
-                                     # Visualizer usually handles CPU tensors fine.
-        torch.from_numpy(visibility),
-        query_frame=query_frame,
+        video_to_save,
+        torch.from_numpy(tracks_to_save),
+        torch.from_numpy(visibility_to_save),
+        query_frame=adjusted_query_frame,
     )
-    # print(f"Finished saving and visualizing for chunk {startindex}_{endindex}")
 
 
 if __name__ == "__main__":
@@ -142,6 +159,13 @@ if __name__ == "__main__":
         help="number of frames to be processed in a chunk",
     )
     parser.add_argument("-s", "--save_dir", type=str, default="./saved_datas", help="directory to save output video")
+    parser.add_argument(
+        "-o",
+        "--overlap_frames",
+        type=int,
+        default=0,
+        help="number of overlapping frames between consecutive chunks for tracking continuity",
+    )
     args = parser.parse_args()
 
     if args.checkpoint is not None:
@@ -166,7 +190,19 @@ if __name__ == "__main__":
         exit("请提供 --frame_dir 参数，指向包含 frame_*.jpg/png 文件的目录")
 
     frame_files = read_frames_list_from_dir(args.frame_dir)
-    videochunks = (len(frame_files) + args.chunksize - 1) // args.chunksize
+    
+    # Validate overlap parameter
+    if args.overlap_frames >= args.chunksize:
+        raise ValueError(f"overlap_frames ({args.overlap_frames}) must be less than chunksize ({args.chunksize})")
+    
+    # Calculate effective chunk step (how many new frames per chunk)
+    chunk_step = args.chunksize - args.overlap_frames
+    
+    # Calculate total number of chunks considering overlap
+    if len(frame_files) <= args.chunksize:
+        videochunks = 1
+    else:
+        videochunks = 1 + (len(frame_files) - args.chunksize + chunk_step - 1) // chunk_step
     
     # Create a thread pool for background saving/visualization
     # Adjust max_workers as needed. Too high might cause OOM or IO contention.
@@ -174,9 +210,24 @@ if __name__ == "__main__":
     futures = []
 
     for chunkidx in tqdm(range(videochunks), desc="Processing chunks"):
-        startindex = chunkidx * args.chunksize
-        endindex = min((chunkidx + 1) * args.chunksize, len(frame_files))
+        # Calculate chunk boundaries with overlap
+        if chunkidx == 0:
+            startindex = 0
+            endindex = min(args.chunksize, len(frame_files))
+        else:
+            startindex = chunkidx * chunk_step
+            endindex = min(startindex + args.chunksize, len(frame_files))
+        
         chunk_frame_files = frame_files[startindex:endindex]
+        
+        # Calculate the actual new frames (non-overlapping portion) for saving
+        if chunkidx == 0:
+            new_frames_start = 0
+        else:
+            new_frames_start = args.overlap_frames
+        
+        # For the last chunk, adjust if it's shorter
+        actual_chunk_size = len(chunk_frame_files)
         save_path = os.path.join(args.save_dir, f"{startindex}_{endindex}")
         if os.path.exists(save_path):
             print(f"Skipping already processed chunk {startindex}_{endindex}")
@@ -259,13 +310,15 @@ if __name__ == "__main__":
         future = save_executor.submit(
             save_and_visualize,
             args.save_dir,
-            f"./saved_videos/{startindex}_{endindex}", # Note: logic inside uses this as base
+            f"./saved_videos/{startindex}_{endindex}",
             startindex,
             endindex,
             tracks_cpu,
             visibility_cpu,
             video_cpu,
-            query_frame_val
+            query_frame_val,
+            new_frames_start,
+            False  # save_overlap=False to avoid duplicate frames
         )
         futures.append(future)
         torch.cuda.empty_cache()  # Clear GPU memory after each chunk to avoid OOM
